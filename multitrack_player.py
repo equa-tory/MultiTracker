@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-MultiTrack Player — Perfect-sync multi-track audio player
-══════════════════════════════════════════════════════════
-
+MultiTrack Player
   pip install sounddevice soundfile numpy
-  pip install scipy        # optional – better resampling
-  pip install librosa      # optional – MP3/AAC support
-  pip install tkinterdnd2  # optional – drag-and-drop
+  pip install scipy        # better resampling
+  pip install librosa      # MP3/AAC support
+  pip install tkinterdnd2  # drag-and-drop
 
-  Keyboard shortcuts
-  Space / ← → / Shift+←→ / Ctrl+←→ / Home End
-  1-9  jump to flag      Shift+1-9  set flag
+  Mute button states:
+    RED  M  = individually muted
+    DIM  M  = active (follows group)
+   ORANGE M  = muted via group  → click to OVERRIDE (let this track play)
+    GRN  ↑  = overriding group mute  → click to re-follow group
 """
 
 import json
+import hashlib
+import os
 from math import gcd
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import sounddevice as sd
@@ -27,142 +30,117 @@ try:
     from scipy.signal import resample_poly; _SCIPY = True
 except ImportError:
     _SCIPY = False
-
 try:
     import librosa; _LIBROSA = True
 except ImportError:
     _LIBROSA = False
-
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD; _DND = True
 except ImportError:
     _DND = False
 
-# ── audio ──────────────────────────────────────────────────────────────────
-SR        = 44100
-NCH       = 2
-BLOCKSIZE = 512
-POLL_MS   = 40
-NFLAGS    = 9
+SR         = 44100
+NCH        = 2
+BLOCKSIZE  = 512
+POLL_MS    = 40
+NFLAGS     = 9
 AUDIO_EXTS = {".wav",".flac",".ogg",".aiff",".aif",".mp3",".m4a",".opus",".w64"}
+WV_W, WV_H = 130, 28   # waveform canvas dimensions
 
-# ── colours ────────────────────────────────────────────────────────────────
-BG      = "#111120"
-BG2     = "#1a1a30"
-BG3     = "#242440"
-BG4     = "#30305a"
-BG5     = "#44447a"
-FG      = "#ddddf8"
-FG2     = "#7777aa"
-ACCENT  = "#6699ff"
-GREEN   = "#44ee88"
-RED     = "#ff4466"
-YELLOW  = "#ffcc33"
-PURPLE  = "#bb66ff"
+BG     = "#111120"; BG2 = "#1a1a30"; BG3 = "#242440"
+BG4    = "#30305a"; BG5 = "#44447a"
+FG     = "#ddddf8"; FG2 = "#7777aa"
+ACCENT = "#6699ff"; GREEN = "#44ee88"; RED = "#ff4466"
+YELLOW = "#ffcc33"; PURPLE = "#bb66ff"; ORANGE = "#ffaa33"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Helpers
-# ══════════════════════════════════════════════════════════════════════════
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _peaks(data: np.ndarray, width: int = WV_W) -> np.ndarray:
+    mono = np.max(np.abs(data), axis=1)
+    n = len(mono)
+    if n == 0:
+        return np.zeros(width, dtype=np.float32)
+    pad = (-n) % width
+    if pad:
+        mono = np.pad(mono, (0, pad))
+    return mono.reshape(width, -1).max(axis=1).astype(np.float32)
 
 def mk_btn(parent, text, cmd, **kw):
-    """
-    Create a flat dark-theme button.
-    Caller kwargs OVERRIDE defaults — uses dict.update() so there
-    are NEVER duplicate keyword arguments passed to tk.Button.
-    """
-    cfg = dict(relief="flat", bd=0, padx=8, pady=4,
-               cursor="hand2", bg=BG3, fg=FG,
-               font=("monospace", 9),
+    """Flat button — uses dict.update so caller kwargs NEVER duplicate."""
+    cfg = dict(relief="flat", bd=0, padx=8, pady=4, cursor="hand2",
+               bg=BG3, fg=FG, font=("monospace", 9),
                activebackground=BG4, activeforeground=FG)
-    cfg.update(kw)          # ← overrides, never duplicates
+    cfg.update(kw)
     return tk.Button(parent, text=text, command=cmd, **cfg)
 
+def hsep(p): tk.Frame(p, bg=BG4, height=1).pack(fill="x")
+def fmt(s):  s=int(s); return f"{s//60}:{s%60:02d}"
+def trunc(s, n): return s if len(s) <= n else s[:n-1]+"…"
 
-def hsep(parent):
-    tk.Frame(parent, bg=BG4, height=1).pack(fill="x")
-
-
-def fmt(sec: float) -> str:
-    s = int(sec); return f"{s // 60}:{s % 60:02d}"
-
-
-def trunc(s: str, n: int) -> str:
-    return s if len(s) <= n else s[:n-1] + "…"
-
-
-def parse_dnd(data: str) -> list[str]:
+def parse_dnd(data):
     paths, data = [], data.strip()
     while data:
         if data.startswith("{"):
-            end = data.index("}")
-            paths.append(data[1:end]); data = data[end+1:].strip()
+            e = data.index("}"); paths.append(data[1:e]); data = data[e+1:].strip()
         else:
-            parts = data.split(None, 1)
-            paths.append(parts[0]); data = parts[1].strip() if len(parts) > 1 else ""
+            p = data.split(None, 1); paths.append(p[0]); data = p[1].strip() if len(p)>1 else ""
     return paths
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Data model
-# ══════════════════════════════════════════════════════════════════════════
+# ── model ─────────────────────────────────────────────────────────────────────
 
 class Group:
     def __init__(self, name):
-        self.name  = name
-        self.muted = False
+        self.name      = name
+        self.muted     = False
+        self.collapsed = False   # persisted in save file
 
 class Track:
-    def __init__(self, path, data, group):
-        self.path   = path
-        self.name   = Path(path).stem
-        self.data   = data          # (N,2) float32
-        self.group  = group
-        self.muted  = False
-        self.volume = 1.0
+    def __init__(self, path, data, group, peaks=None):
+        self.path            = path
+        self.name            = Path(path).stem
+        self.data            = data
+        self.group           = group
+        self.muted           = False
+        self.unmute_override = False
+        self.volume          = 1.0
+        self.peaks           = peaks if peaks is not None else _peaks(data)
 
     @property
     def effective_mute(self):
-        return self.muted or self.group.muted
+        if self.muted:            return True
+        if self.unmute_override:  return False   # beats group mute
+        return self.group.muted
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Engine  (one callback → perfect sync)
-# ══════════════════════════════════════════════════════════════════════════
+# ── engine ────────────────────────────────────────────────────────────────────
 
 class Engine:
     def __init__(self):
-        self.tracks      = []
-        self.groups      = {}
-        self.total_frames= 0
-        self.master_vol  = 1.0
-        self._frame      = 0
-        self._playing    = False
-        self._seek       = None
-        self.flags       = [None] * NFLAGS
-        self._stream     = None
-        self._buf        = np.zeros((BLOCKSIZE + 256, NCH), dtype=np.float32)
+        self.tracks = []; self.groups = {}; self.total_frames = 0
+        self.master_vol = 1.0
+        self._frame = 0; self._playing = False; self._seek = None
+        self.flags = [None]*NFLAGS; self._stream = None
+        self._buf = np.zeros((BLOCKSIZE+256, NCH), dtype=np.float32)
 
     @property
-    def frame(self)   : return self._frame
+    def frame(self):    return self._frame
     @property
-    def playing(self) : return self._playing
+    def playing(self):  return self._playing
     @property
-    def pos_sec(self) : return self._frame / SR
+    def pos_sec(self):  return self._frame / SR
     @property
-    def dur_sec(self) : return self.total_frames / SR
+    def dur_sec(self):  return self.total_frames / SR
 
-    # loading
     @staticmethod
     def _read(path):
-        try:
-            return sf.read(path, dtype="float32", always_2d=True)
+        try: return sf.read(path, dtype="float32", always_2d=True)
         except Exception as e:
             if not _LIBROSA:
-                raise RuntimeError(f"Can't read {Path(path).name}: {e}\n"
-                                   "pip install librosa  for MP3/AAC") from e
+                raise RuntimeError(f"Can't read {Path(path).name}: {e}\npip install librosa") from e
             d, r = librosa.load(path, sr=None, mono=False, dtype=np.float32)
-            if d.ndim == 1: d = d[np.newaxis, :]
+            if d.ndim == 1: d = d[np.newaxis,:]
             return np.asfortranarray(d).T.astype(np.float32), r
 
     @staticmethod
@@ -176,71 +154,55 @@ class Engine:
         if _SCIPY:
             g = gcd(dst, src)
             return resample_poly(d, dst//g, src//g, axis=0).astype(np.float32)
-        n  = int(len(d) * dst / src)
-        xs = np.arange(len(d), dtype=np.float64)
+        n = int(len(d)*dst/src); xs = np.arange(len(d), dtype=np.float64)
         xn = np.linspace(0, len(d)-1, n)
         out = np.empty((n, d.shape[1]), dtype=np.float32)
-        for c in range(d.shape[1]):
-            out[:, c] = np.interp(xn, xs, d[:, c])
+        for c in range(d.shape[1]): out[:,c] = np.interp(xn, xs, d[:,c])
         return out
 
     def add_track(self, path, group_name="Default"):
         d, sr = self._read(path)
-        d = self._stereo(d)
-        d = self._resample(d, sr, SR)
+        d = self._stereo(d); d = self._resample(d, sr, SR)
         d = np.ascontiguousarray(d, dtype=np.float32)
-        if group_name not in self.groups:
-            self.groups[group_name] = Group(group_name)
+        if group_name not in self.groups: self.groups[group_name] = Group(group_name)
         t = Track(str(path), d, self.groups[group_name])
-        self.tracks.append(t)
-        self.total_frames = max(self.total_frames, len(d))
+        self.tracks.append(t); self.total_frames = max(self.total_frames, len(d))
         return t
 
     def remove_track(self, t):
         if t in self.tracks: self.tracks.remove(t)
         self.total_frames = max((len(x.data) for x in self.tracks), default=0)
 
-    # callback
     def _cb(self, outdata, frames, _t, _s):
-        if frames > self._buf.shape[0]:
-            self._buf = np.zeros((frames+64, NCH), dtype=np.float32)
+        if frames > self._buf.shape[0]: self._buf = np.zeros((frames+64,NCH), dtype=np.float32)
         s = self._seek
-        if s is not None:
-            self._seek = None; self._frame = s
+        if s is not None: self._seek = None; self._frame = s
         pos = self._frame
-        if not self._playing or pos >= self.total_frames:
-            outdata.fill(0.0); return
-        buf = self._buf[:frames]; buf.fill(0.0)
-        mv  = self.master_vol
+        if not self._playing or pos >= self.total_frames: outdata.fill(0.0); return
+        buf = self._buf[:frames]; buf.fill(0.0); mv = self.master_vol
         for t in self.tracks[:]:
             if t.effective_mute: continue
             end = min(pos+frames, len(t.data)); n = end-pos
             if n <= 0: continue
             buf[:n] += t.data[pos:end] * (t.volume * mv)
-        np.clip(buf, -1.0, 1.0, out=buf)
-        outdata[:] = buf
+        np.clip(buf, -1.0, 1.0, out=buf); outdata[:] = buf
         self._frame += frames
-        if self._frame >= self.total_frames:
-            self._playing = False; self._frame = self.total_frames
+        if self._frame >= self.total_frames: self._playing = False; self._frame = self.total_frames
 
     def _open(self):
         if self._stream and self._stream.active: return
         if self._stream: self._stream.close()
-        self._stream = sd.OutputStream(
-            samplerate=SR, channels=NCH, dtype="float32",
-            blocksize=BLOCKSIZE, callback=self._cb)
-        self._stream.start()
+        self._stream = sd.OutputStream(samplerate=SR, channels=NCH, dtype="float32",
+                                       blocksize=BLOCKSIZE, callback=self._cb); self._stream.start()
 
     def play(self):
         if self.tracks: self._open(); self._playing = True
     def pause(self):   self._playing = False
     def toggle(self):  (self.pause if self._playing else self.play)()
-    def seek(self, f):
-        f = max(0, min(int(f), self.total_frames))
-        self._seek = f; self._frame = f
-    def seek_sec(self, s):   self.seek(int(s * SR))
-    def seek_rel(self, ds):  self.seek_sec(self.pos_sec + ds)
-    def set_flag(self, i):   self.flags[i] = self._frame
+    def seek(self, f): f=max(0,min(int(f),self.total_frames)); self._seek=f; self._frame=f
+    def seek_sec(self, s):  self.seek(int(s*SR))
+    def seek_rel(self, ds): self.seek_sec(self.pos_sec+ds)
+    def set_flag(self, i):  self.flags[i] = self._frame
     def goto_flag(self, i):
         if self.flags[i] is not None: self.seek(self.flags[i])
     def close(self):
@@ -248,36 +210,95 @@ class Engine:
         if self._stream: self._stream.stop(); self._stream.close(); self._stream = None
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  SeekBar
-# ══════════════════════════════════════════════════════════════════════════
+# ── waveform canvas ───────────────────────────────────────────────────────────
+
+class WaveformCanvas(tk.Canvas):
+    """
+    Performance-optimised waveform display.
+    - Waveform lines drawn ONCE after layout (never redrawn unless mute state changes).
+    - Playhead & overlay are pre-created items moved with coords() — zero alloc per frame.
+    """
+    def __init__(self, parent, track, **kw):
+        super().__init__(parent, bg=BG3, height=WV_H, highlightthickness=0, **kw)
+        self._track_peaks = track.peaks
+        self._muted       = False
+        self._last_frac   = 0.0
+        # Pre-create overlay + playhead so update_pos never allocates
+        self._ov = self.create_rectangle(0, 0, 0, WV_H, fill=BG5,
+                                         stipple="gray25", outline="", state="hidden")
+        self._ph = self.create_line(0, 0, 0, WV_H, fill=PURPLE, width=1)
+        # Draw waveform once the widget has a real width
+        self.after_idle(self._initial_draw)
+
+    def _initial_draw(self):
+        if self.winfo_width() > 1:
+            self._draw_wv()
+        else:
+            self.after(50, self._initial_draw)   # retry until layout is done
+
+    def _resample_peaks(self, width):
+        src = self._track_peaks
+        if len(src) == 0 or width <= 0:
+            return np.zeros(max(1, width), dtype=np.float32)
+        return np.interp(np.linspace(0, 1, width),
+                         np.linspace(0, 1, len(src)), src).astype(np.float32)
+
+    def _draw_wv(self):
+        """Draw static waveform lines. Called once (or when mute colour changes)."""
+        self.delete("wv")
+        w   = max(1, self.winfo_width())
+        mid = WV_H // 2
+        col = FG2 if self._muted else ACCENT
+        for x, p in enumerate(self._resample_peaks(w)):
+            amp = max(1, int(p * (mid - 2) * 0.95))
+            self.create_line(x, mid - amp, x, mid + amp, fill=col, tags="wv")
+        # Keep overlay + playhead on top
+        self.tag_raise(self._ov)
+        self.tag_raise(self._ph)
+
+    def update_pos(self, frac: float):
+        """Cheap — moves two pre-existing items, no allocation."""
+        self._last_frac = frac
+        w = max(1, self.winfo_width())
+        x = max(0, int(frac * w))
+        if x > 1:
+            self.coords(self._ov, 0, 0, x, WV_H)
+            self.itemconfig(self._ov, state="normal")
+        else:
+            self.itemconfig(self._ov, state="hidden")
+        self.coords(self._ph, x, 0, x, WV_H)
+
+    def set_muted(self, muted: bool):
+        if muted != self._muted:
+            self._muted = muted
+            self._draw_wv()   # recolour waveform only on mute change
+
+
+# ── seek bar ──────────────────────────────────────────────────────────────────
 
 class SeekBar(tk.Canvas):
     PAD = 28
     def __init__(self, parent, engine, **kw):
-        super().__init__(parent, bg=BG, height=58, highlightthickness=0,
-                         cursor="hand2", **kw)
+        super().__init__(parent, bg=BG, height=58, highlightthickness=0, cursor="hand2", **kw)
         self.engine = engine; self._drag = False
-        self.bind("<Configure>",       self._draw)
+        self.bind("<Configure>", self._draw)
         self.bind("<ButtonPress-1>",   self._press)
         self.bind("<B1-Motion>",       self._motion)
         self.bind("<ButtonRelease-1>", lambda _: setattr(self,"_drag",False))
 
     def _frac(self, x):
         w = self.winfo_width()
-        return max(0.0, min(1.0, (x-self.PAD) / max(1, w-2*self.PAD)))
+        return max(0.0, min(1.0, (x-self.PAD)/max(1, w-2*self.PAD)))
     def _tx(self, frame):
         w = self.winfo_width()
         return self.PAD + (frame/max(1,self.engine.total_frames))*(w-2*self.PAD)
     def _press(self, e):
-        self._drag = True
-        self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
+        self._drag = True; self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
     def _motion(self, e):
         if self._drag: self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
     def update(self): self._draw()
     def _draw(self, *_):
-        self.delete("all")
-        w = self.winfo_width()
+        self.delete("all"); w = self.winfo_width()
         if w < 30: return
         MID, BH = 36, 6
         self.create_rectangle(self.PAD, MID-BH, w-self.PAD, MID+BH, fill=BG4, outline="")
@@ -293,313 +314,326 @@ class SeekBar(tk.Canvas):
             self.create_text(fx, MID-BH-12, text=str(i+1), fill=YELLOW, font=("monospace",7,"bold"))
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  GroupHeader
-# ══════════════════════════════════════════════════════════════════════════
+# ── group header ──────────────────────────────────────────────────────────────
 
 class GroupHeader(tk.Frame):
     def __init__(self, parent, group, on_refresh, **kw):
         super().__init__(parent, bg=BG3, **kw)
-        self.group       = group
-        self._on_refresh = on_refresh
+        self.group = group; self._on_refresh = on_refresh
+        self.collapsed = group.collapsed   # restore from model
+        self._rows = []
 
-        tk.Label(self, text=f"  ▸  {group.name}",
-                 bg=BG3, fg=GREEN, font=("monospace", 10, "bold")
-                 ).pack(side="left", pady=4, padx=4)
+        # Collapse arrow
+        self._arrow = tk.Label(self, text="▾", bg=BG3, fg=GREEN,
+                               font=("monospace",13), cursor="hand2", padx=4)
+        self._arrow.pack(side="left", pady=3)
+        self._arrow.bind("<Button-1>", lambda _: self._toggle_collapse())
 
-        self._mb = mk_btn(self, "MUTE GROUP", self._toggle,
-                          font=("monospace", 8), padx=10, pady=2)
-        self._mb.pack(side="right", padx=8, pady=4)
-        self._sync()
+        # Group name (also clickable to collapse)
+        lbl = tk.Label(self, text=group.name, bg=BG3, fg=GREEN,
+                       font=("monospace",10,"bold"), cursor="hand2")
+        lbl.pack(side="left", pady=3)
+        lbl.bind("<Button-1>", lambda _: self._toggle_collapse())
 
-    def _toggle(self):
+        # Track count badge
+        self._count = tk.Label(self, text="", bg=BG3, fg=FG2, font=("monospace",8))
+        self._count.pack(side="left", padx=6, pady=3)
+
+        # Mute group
+        self._mb = mk_btn(self, "MUTE GROUP", self._toggle_mute,
+                          font=("monospace",8), padx=10, pady=2)
+        self._mb.pack(side="right", padx=8, pady=3)
+        self._sync_mute()
+
+    def set_rows(self, rows):
+        self._rows = rows
+        self._count.configure(text=f"({len(rows)} tracks)")
+
+    def _toggle_collapse(self):
+        self.collapsed = not self.collapsed
+        self.group.collapsed = self.collapsed   # persist in model
+        self._arrow.configure(text="▸" if self.collapsed else "▾")
+        for row in self._rows:
+            if self.collapsed: row.pack_forget()
+            else:              row.pack(fill="x", padx=(24,4), pady=1)
+
+    def _toggle_mute(self):
         self.group.muted = not self.group.muted
-        self._sync(); self._on_refresh()
+        self._sync_mute(); self._on_refresh()
 
-    def _sync(self):
+    def _sync_mute(self):
         self._mb.configure(bg=RED if self.group.muted else BG4,
                            fg=BG  if self.group.muted else FG)
 
-    def refresh(self): self._sync()
+    def refresh(self): self._sync_mute()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  TrackRow  — every button uses mk_btn() which never duplicates kwargs
-# ══════════════════════════════════════════════════════════════════════════
+# ── track row ─────────────────────────────────────────────────────────────────
 
 class TrackRow(tk.Frame):
+    """
+    Mute button cycles based on context:
+      Normal state:         M (dim)   → click → RED M  (individually muted)
+      Individually muted:   M (red)   → click → dim M  (unmuted)
+      Group muted, track following:
+                          M (orange) → click → GRN ↑  (override: track plays)
+      Overriding group:   ↑ (green)  → click → orange M (back to group mute)
+    """
     def __init__(self, parent, track, engine, on_rebuild, on_refresh, **kw):
         super().__init__(parent, bg=BG2, **kw)
-        self.track    = track
-        self.engine   = engine
-        self._rebuild = on_rebuild
-        self._refresh = on_refresh
+        self.track = track; self.engine = engine
+        self._rebuild = on_rebuild; self._refresh = on_refresh
         self._build()
 
     def _build(self):
-        # Mute button
-        self._mb = mk_btn(self, "M", self._toggle_mute,
-                          width=2, padx=4, pady=3)
-        self._mb.pack(side="left", padx=(6,2), pady=3)
+        # ── left-anchored fixed items ──
+        self._mb = mk_btn(self, "M", self._toggle_mute, width=2, padx=4, pady=3)
+        self._mb.pack(side="left", padx=(6,3), pady=3)
 
-        # Track name
-        tk.Label(self, text=self.track.name,
-                 bg=BG2, fg=FG, font=("monospace", 9),
-                 anchor="w", width=24
+        tk.Label(self, text=self.track.name, bg=BG2, fg=FG,
+                 font=("monospace",9), anchor="w", width=18
                  ).pack(side="left", padx=4)
 
-        # Remove button
-        mk_btn(self, "✕", self._remove,
-               fg=FG2, padx=6, pady=3
+        # ── right-anchored fixed items (packed before waveform so pack
+        #    allocates their space first, leaving the rest for the wave) ──
+        mk_btn(self, "✕", self._remove, fg=FG2, padx=6, pady=3
                ).pack(side="right", padx=(0,6), pady=3)
-
-        # Group badge
-        self._gb = mk_btn(self, trunc(self.track.group.name, 14),
-                          self._edit_group,
-                          fg=GREEN, font=("monospace", 8), padx=6, pady=2)
+        self._gb = mk_btn(self, trunc(self.track.group.name,12), self._edit_group,
+                          fg=GREEN, font=("monospace",8), padx=6, pady=2)
         self._gb.pack(side="right", padx=2, pady=3)
-
-        # Volume % label
-        self._vl = tk.Label(self, text="100%", bg=BG2, fg=FG2,
-                             font=("monospace", 8), width=4)
+        self._vl = tk.Label(self, text="100%", bg=BG2, fg=FG2, font=("monospace",8), width=4)
         self._vl.pack(side="right", padx=(0,2))
-
-        # Volume slider
         self._vv = tk.DoubleVar(value=self.track.volume)
         ttk.Scale(self, from_=0.0, to=1.5, variable=self._vv,
-                  orient="horizontal", length=80,
-                  command=self._on_vol
+                  orient="horizontal", length=80, command=self._on_vol
                   ).pack(side="right", padx=4)
+
+        # ── waveform: last — fills ALL remaining horizontal space ──
+        self._wv = WaveformCanvas(self, self.track)
+        self._wv.pack(side="left", fill="x", expand=True, padx=4, pady=2)
 
         self._sync()
 
     def _toggle_mute(self):
-        self.track.muted = not self.track.muted
+        t = self.track
+        if t.muted:
+            # individually muted → unmute normally
+            t.muted = False; t.unmute_override = False
+        elif t.group.muted and t.unmute_override:
+            # was overriding group mute → stop overriding (follow group again)
+            t.unmute_override = False
+        elif t.group.muted:
+            # group muted, track following → override so THIS track plays
+            t.unmute_override = True
+        else:
+            # active normally → mute individually
+            t.muted = True
         self._sync(); self._refresh()
 
     def _sync(self):
-        on = self.track.effective_mute
-        self._mb.configure(bg=RED if on else BG4, fg=BG if on else FG2,
-                           text="M")
+        t = self.track
+        if t.muted:
+            self._mb.configure(bg=RED,    fg=BG,  text="M"); self._wv.set_muted(True)
+        elif t.unmute_override:
+            self._mb.configure(bg=GREEN,  fg=BG,  text="↑"); self._wv.set_muted(False)
+        elif t.group.muted:
+            self._mb.configure(bg=ORANGE, fg=BG,  text="M"); self._wv.set_muted(True)
+        else:
+            self._mb.configure(bg=BG4,   fg=FG2, text="M"); self._wv.set_muted(False)
 
     def _on_vol(self, v):
-        v = float(v)
-        self.track.volume = v
-        self._vl.configure(text=f"{int(v*100)}%")
+        v = float(v); self.track.volume = v; self._vl.configure(text=f"{int(v*100)}%")
 
     def _edit_group(self):
-        name = simpledialog.askstring(
-            "Group", "Group name:", initialvalue=self.track.group.name,
-            parent=self.winfo_toplevel())
+        name = simpledialog.askstring("Group","Group name:",
+                                      initialvalue=self.track.group.name,
+                                      parent=self.winfo_toplevel())
         if name:
             name = name.strip() or "Default"
-            if name not in self.engine.groups:
-                self.engine.groups[name] = Group(name)
+            if name not in self.engine.groups: self.engine.groups[name] = Group(name)
             self.track.group = self.engine.groups[name]
-            self._gb.configure(text=trunc(name, 14))
+            self._gb.configure(text=trunc(name,12))
             self.winfo_toplevel().after(1, self._rebuild)
 
     def _remove(self):
         self.engine.remove_track(self.track)
         self.winfo_toplevel().after(1, self._rebuild)
 
-    def refresh(self): self._sync()
+    def refresh(self):   self._sync()
+    def update_pos(self, frac): self._wv.update_pos(frac)
+
+    def set_waveform_visible(self, visible: bool):
+        if visible:
+            # Re-pack after the right-side items so it still expands correctly
+            self._wv.pack(side="left", fill="x", expand=True, padx=4, pady=2)
+            self._wv.after_idle(self._wv._draw_wv)   # redraw at current width
+        else:
+            self._wv.pack_forget()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Application
-# ══════════════════════════════════════════════════════════════════════════
+# ── app ───────────────────────────────────────────────────────────────────────
 
 class App:
     def __init__(self):
         self.engine = Engine()
         self.root   = TkinterDnD.Tk() if _DND else tk.Tk()
-        self._rows  = []
-        self._ghdrs = {}
-        self._setup_style()
-        self._build_ui()
-        self._bind_keys()
-        self._bind_dnd()
-        self._poll()
+        self._rows  = []; self._ghdrs = {}
+        self._setup_style(); self._build_ui()
+        self._bind_keys(); self._bind_dnd(); self._poll()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_style(self):
-        s = ttk.Style(self.root)
-        s.theme_use("clam")
-        s.configure("TScale",              background=BG2, troughcolor=BG4, sliderlength=14)
+        s = ttk.Style(self.root); s.theme_use("clam")
+        s.configure("TScale", background=BG2, troughcolor=BG4, sliderlength=14)
         s.configure("Vertical.TScrollbar", background=BG3, troughcolor=BG2,
                     arrowcolor=FG2, bordercolor=BG2, lightcolor=BG3, darkcolor=BG3)
 
-    # ── UI ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        r = self.root
-        r.title("MultiTrack Player")
-        r.configure(bg=BG)
-        r.geometry("960x700")
-        r.minsize(700, 460)
+        r = self.root; r.title("MultiTrack Player")
+        r.configure(bg=BG); r.geometry("1060x760"); r.minsize(740,500)
 
         # ── toolbar ──
-        tb = tk.Frame(r, bg=BG, pady=6)
-        tb.pack(fill="x", padx=10)
-
-        mk_btn(tb, "＋ Files",   self._add_files ).pack(side="left", padx=2)
-        mk_btn(tb, "📁 Folder",  self._add_folder).pack(side="left", padx=2)
-        tk.Frame(tb, bg=BG5, width=1).pack(side="left", fill="y", padx=8, pady=3)
-        mk_btn(tb, "💾 Save",    self._save      ).pack(side="left", padx=2)
-        mk_btn(tb, "📂 Open",    self._open_proj ).pack(side="left", padx=2)
-        tk.Frame(tb, bg=BG5, width=1).pack(side="left", fill="y", padx=8, pady=3)
-        mk_btn(tb, "Clear All",  self._clear, fg=RED).pack(side="left", padx=2)
-
-        hint = "Space ▶/⏸  ←/→±5s  Shift±30s  1-9 flag  Shift+1-9 set"
-        if _DND: hint += "   ✦ drag files/folders"
-        tk.Label(tb, text=hint, bg=BG, fg=BG5, font=("monospace",8)
-                 ).pack(side="right", padx=6)
-
+        tb = tk.Frame(r, bg=BG, pady=6); tb.pack(fill="x", padx=10)
+        mk_btn(tb,"＋ Files",   self._add_files ).pack(side="left",padx=2)
+        mk_btn(tb,"📁 Folder",  self._add_folder).pack(side="left",padx=2)
+        tk.Frame(tb,bg=BG5,width=1).pack(side="left",fill="y",padx=8,pady=3)
+        mk_btn(tb,"💾 Save",    self._save      ).pack(side="left",padx=2)
+        mk_btn(tb,"📂 Open",    self._open_proj ).pack(side="left",padx=2)
+        tk.Frame(tb,bg=BG5,width=1).pack(side="left",fill="y",padx=8,pady=3)
+        mk_btn(tb,"Mute All",   self._mute_all,   fg=RED   ).pack(side="left",padx=2)
+        mk_btn(tb,"Unmute All", self._unmute_all, fg=GREEN ).pack(side="left",padx=2)
+        tk.Frame(tb,bg=BG5,width=1).pack(side="left",fill="y",padx=8,pady=3)
+        self._show_wv = True
+        self._wv_btn = mk_btn(tb, "📊 Waves", self._toggle_waveforms, fg=GREEN)
+        self._wv_btn.pack(side="left", padx=2)
+        tk.Frame(tb,bg=BG5,width=1).pack(side="left",fill="y",padx=8,pady=3)
+        mk_btn(tb,"Clear All",  self._clear,      fg=FG2   ).pack(side="left",padx=2)
+        hint = "Space  ←/→±5s  Shift±30s  1-9 flag  Shift+1-9 set"
+        if _DND: hint += "  ✦ drag"
+        tk.Label(tb,text=hint,bg=BG,fg=BG5,font=("monospace",8)).pack(side="right",padx=6)
         hsep(r)
 
         # ── track list ──
-        list_frame = tk.Frame(r, bg=BG)
-        list_frame.pack(fill="both", expand=True)
-
-        self._cv = tk.Canvas(list_frame, bg=BG, highlightthickness=0)
-        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self._cv.yview)
-        self._cv.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self._cv.pack(side="left", fill="both", expand=True)
-
-        self._inner = tk.Frame(self._cv, bg=BG)
-        self._cwin  = self._cv.create_window((0,0), window=self._inner, anchor="nw")
-
+        cont = tk.Frame(r,bg=BG); cont.pack(fill="both",expand=True)
+        self._cv = tk.Canvas(cont,bg=BG,highlightthickness=0)
+        vsb = ttk.Scrollbar(cont,orient="vertical",command=self._cv.yview)
+        self._cv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right",fill="y"); self._cv.pack(side="left",fill="both",expand=True)
+        self._inner = tk.Frame(self._cv,bg=BG)
+        self._cwin  = self._cv.create_window((0,0),window=self._inner,anchor="nw")
         self._inner.bind("<Configure>",
             lambda _: self._cv.configure(scrollregion=self._cv.bbox("all")))
         self._cv.bind("<Configure>",
-            lambda e: self._cv.itemconfig(self._cwin, width=e.width))
+            lambda e: self._cv.itemconfig(self._cwin,width=e.width))
         self._cv.bind_all("<MouseWheel>",
-            lambda e: self._cv.yview_scroll(-1*(e.delta//120), "units"))
-        self._cv.bind_all("<Button-4>", lambda _: self._cv.yview_scroll(-1,"units"))
-        self._cv.bind_all("<Button-5>", lambda _: self._cv.yview_scroll(+1,"units"))
-
+            lambda e: self._cv.yview_scroll(-1*(e.delta//120),"units"))
+        self._cv.bind_all("<Button-4>",lambda _: self._cv.yview_scroll(-1,"units"))
+        self._cv.bind_all("<Button-5>",lambda _: self._cv.yview_scroll(+1,"units"))
         hsep(r)
 
         # ── seek bar ──
-        self._sb = SeekBar(r, self.engine)
-        self._sb.pack(fill="x")
-        hsep(r)
+        self._seekbar = SeekBar(r,self.engine); self._seekbar.pack(fill="x"); hsep(r)
 
         # ── transport ──
-        tp = tk.Frame(r, bg=BG, pady=6)
-        tp.pack(fill="x", padx=10)
-
-        self._pb = mk_btn(tp, "▶  Play", self.engine.toggle,
-                          font=("monospace", 11, "bold"))
-        self._pb.pack(side="left", padx=(0,8))
-
-        for label, delta in [("⏮", None), ("◀◀ −30s",-30), ("◀ −5s",-5),
-                              ("▶ +5s",+5), ("▶▶ +30s",+30)]:
+        tp = tk.Frame(r,bg=BG,pady=6); tp.pack(fill="x",padx=10)
+        self._pb = mk_btn(tp,"▶  Play",self.engine.toggle,font=("monospace",11,"bold"))
+        self._pb.pack(side="left",padx=(0,8))
+        for lbl,delta in [("⏮",None),("◀◀ −30s",-30),("◀ −5s",-5),("▶ +5s",+5),("▶▶ +30s",+30)]:
             cmd = (lambda: self.engine.seek(0)) if delta is None \
                   else (lambda d=delta: self.engine.seek_rel(d))
-            mk_btn(tp, label, cmd).pack(side="left", padx=2)
-
+            mk_btn(tp,lbl,cmd).pack(side="left",padx=2)
         self._tv = tk.StringVar(value="0:00 / 0:00")
-        tk.Label(tp, textvariable=self._tv, bg=BG, fg=ACCENT,
-                 font=("monospace", 15, "bold"), width=14
-                 ).pack(side="left", padx=14)
-
-        # master vol
-        self._mv_lbl = tk.Label(tp, text="100%", bg=BG, fg=FG2,
-                                 font=("monospace",8), width=4)
-        self._mv_lbl.pack(side="right", padx=(0,2))
+        tk.Label(tp,textvariable=self._tv,bg=BG,fg=ACCENT,
+                 font=("monospace",15,"bold"),width=14).pack(side="left",padx=14)
+        self._mv_lbl = tk.Label(tp,text="100%",bg=BG,fg=FG2,font=("monospace",8),width=4)
+        self._mv_lbl.pack(side="right",padx=(0,2))
         self._mv = tk.DoubleVar(value=1.0)
-        ttk.Scale(tp, from_=0.0, to=1.5, variable=self._mv,
-                  orient="horizontal", length=90,
+        ttk.Scale(tp,from_=0.0,to=1.5,variable=self._mv,orient="horizontal",length=90,
                   command=lambda v: setattr(self.engine,"master_vol",float(v))
-                  ).pack(side="right", padx=2)
-        tk.Label(tp, text="Vol:", bg=BG, fg=FG2, font=("monospace",8)
-                 ).pack(side="right", padx=(0,2))
-
+                  ).pack(side="right",padx=2)
+        tk.Label(tp,text="Vol:",bg=BG,fg=FG2,font=("monospace",8)).pack(side="right",padx=(0,2))
         hsep(r)
 
-        # ── flags: two rows (SET + GO) ──
-        flag_frame = tk.Frame(r, bg=BG, pady=2)
-        flag_frame.pack(fill="x", padx=10, pady=(2,6))
+        # ── flags ──
+        ff = tk.Frame(r,bg=BG,pady=2); ff.pack(fill="x",padx=10,pady=(2,6))
 
-        set_row = tk.Frame(flag_frame, bg=BG)
-        set_row.pack(fill="x", pady=(0,2))
-        tk.Label(set_row, text="Set flag:", bg=BG, fg=FG2,
-                 font=("monospace",8), width=8, anchor="e"
-                 ).pack(side="left", padx=(0,4))
+        sr_ = tk.Frame(ff,bg=BG); sr_.pack(fill="x",pady=(0,2))
+        tk.Label(sr_,text="Set flag:",bg=BG,fg=FG2,font=("monospace",8),
+                 width=8,anchor="e").pack(side="left",padx=(0,4))
         self._set_fbs = []
         for i in range(NFLAGS):
-            b = tk.Button(set_row, text=str(i+1), width=2,
-                          bg=BG4, fg=FG2, relief="flat", bd=0,
-                          padx=4, pady=2, cursor="hand2",
-                          font=("monospace",9),
-                          activebackground=BG5, activeforeground=FG,
+            b = tk.Button(sr_,text=str(i+1),width=2,bg=BG4,fg=FG2,relief="flat",bd=0,
+                          padx=4,pady=2,cursor="hand2",font=("monospace",9),
+                          activebackground=BG5,activeforeground=FG,
                           command=lambda idx=i: self._set_flag(idx))
-            b.pack(side="left", padx=2)
-            self._set_fbs.append(b)
-        tk.Label(set_row, text="  click to pin current position",
-                 bg=BG, fg=BG5, font=("monospace",8)).pack(side="left", padx=4)
+            b.pack(side="left",padx=2); self._set_fbs.append(b)
+        tk.Label(sr_,text="  click to pin current position",
+                 bg=BG,fg=BG5,font=("monospace",8)).pack(side="left",padx=4)
 
-        go_row = tk.Frame(flag_frame, bg=BG)
-        go_row.pack(fill="x")
-        tk.Label(go_row, text="Go to:", bg=BG, fg=FG2,
-                 font=("monospace",8), width=8, anchor="e"
-                 ).pack(side="left", padx=(0,4))
+        gr_ = tk.Frame(ff,bg=BG); gr_.pack(fill="x")
+        tk.Label(gr_,text="Go to:",bg=BG,fg=FG2,font=("monospace",8),
+                 width=8,anchor="e").pack(side="left",padx=(0,4))
         self._fbs = []
         for i in range(NFLAGS):
-            b = tk.Button(go_row, text=str(i+1), width=2,
-                          bg=BG3, fg=YELLOW, relief="flat", bd=0,
-                          padx=4, pady=2, cursor="hand2",
-                          font=("monospace",9,"bold"),
-                          activebackground=BG4, activeforeground=YELLOW,
+            b = tk.Button(gr_,text=str(i+1),width=2,bg=BG3,fg=YELLOW,relief="flat",bd=0,
+                          padx=4,pady=2,cursor="hand2",font=("monospace",9,"bold"),
+                          activebackground=BG4,activeforeground=YELLOW,
                           command=lambda idx=i: self.engine.goto_flag(idx))
-            b.pack(side="left", padx=2)
-            self._fbs.append(b)
-        tk.Label(go_row, text="  jump (dims when unset)",
-                 bg=BG, fg=BG5, font=("monospace",8)).pack(side="left", padx=4)
+            b.pack(side="left",padx=2); self._fbs.append(b)
+        tk.Label(gr_,text="  jump  (dims when unset)",
+                 bg=BG,fg=BG5,font=("monospace",8)).pack(side="left",padx=4)
 
-    # ── track list ───────────────────────────────────────────────────────────
+    # ── track list ────────────────────────────────────────────────────────────
     def rebuild(self):
-        for w in self._inner.winfo_children():
-            w.destroy()
+        for w in self._inner.winfo_children(): w.destroy()
         self._rows.clear(); self._ghdrs.clear()
-
         if not self.engine.tracks:
             msg = "No tracks  —  ＋ Files  /  📁 Folder"
             if _DND: msg += "  /  drag here"
-            tk.Label(self._inner, text=f"\n  {msg}\n",
-                     bg=BG, fg=BG5, font=("monospace",10)
-                     ).pack(anchor="w", padx=16, pady=12)
+            tk.Label(self._inner,text=f"\n  {msg}\n",
+                     bg=BG,fg=BG5,font=("monospace",10)).pack(anchor="w",padx=16,pady=12)
             return
-
         by_group = {}
-        for t in self.engine.tracks:
-            by_group.setdefault(t.group.name, []).append(t)
-
+        for t in self.engine.tracks: by_group.setdefault(t.group.name,[]).append(t)
         for gname, tracks in by_group.items():
             group = self.engine.groups[gname]
-            hdr   = GroupHeader(self._inner, group, self._refresh_rows)
-            hdr.pack(fill="x", pady=(8,0))
-            self._ghdrs[gname] = hdr
-
+            hdr = GroupHeader(self._inner,group,self._refresh_rows)
+            hdr.pack(fill="x",pady=(8,0)); self._ghdrs[gname] = hdr
+            trows = []
             for t in tracks:
-                row = TrackRow(self._inner, t, self.engine,
-                               on_rebuild=self.rebuild,
-                               on_refresh=self._refresh_rows)
-                row.pack(fill="x", padx=(24,4), pady=1)
-                self._rows.append(row)
-
-        tk.Frame(self._inner, bg=BG, height=12).pack()
+                row = TrackRow(self._inner,t,self.engine,
+                               on_rebuild=self.rebuild,on_refresh=self._refresh_rows)
+                row.pack(fill="x",padx=(24,4),pady=1)
+                if not self._show_wv:
+                    row._wv.pack_forget()
+                self._rows.append(row); trows.append(row)
+            hdr.set_rows(trows)
+        tk.Frame(self._inner,bg=BG,height=12).pack()
 
     def _refresh_rows(self):
         for r in self._rows:            r.refresh()
         for h in self._ghdrs.values(): h.refresh()
 
-    # ── load ────────────────────────────────────────────────────────────────
+    # ── global mute ───────────────────────────────────────────────────────────
+    def _mute_all(self):
+        for t in self.engine.tracks: t.muted=True;  t.unmute_override=False
+        for g in self.engine.groups.values(): g.muted=False
+        self._refresh_rows()
+
+    def _unmute_all(self):
+        for t in self.engine.tracks: t.muted=False; t.unmute_override=False
+        for g in self.engine.groups.values(): g.muted=False
+        self._refresh_rows()
+
+    def _toggle_waveforms(self):
+        self._show_wv = not self._show_wv
+        self._wv_btn.configure(fg=GREEN if self._show_wv else FG2)
+        for row in self._rows:
+            row.set_waveform_visible(self._show_wv)
+
+    # ── file loading ──────────────────────────────────────────────────────────
     def _add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Select audio files",
+        paths = filedialog.askopenfilenames(title="Select audio files",
             filetypes=[("Audio","*.wav *.flac *.ogg *.aiff *.aif *.mp3 *.m4a *.opus *.w64"),
                        ("All","*.*")])
         if paths: self._ingest(list(paths))
@@ -609,153 +643,319 @@ class App:
         if not folder: return
         paths = sorted(str(p) for p in Path(folder).rglob("*")
                        if p.suffix.lower() in AUDIO_EXTS and p.is_file())
-        if not paths:
-            messagebox.showwarning("Empty","No audio files found."); return
-        self._ingest(paths, base=folder)
+        if not paths: messagebox.showwarning("Empty","No audio files found."); return
+        cache_dir = Path(folder) / ".multitrack_cache"
+        self._ingest(paths, base=folder, cache_dir=str(cache_dir))
 
-    def _ingest(self, paths, base=""):
-        errors = []
-        for p in paths:
-            if Path(p).suffix.lower() not in AUDIO_EXTS: continue
-            try:
+    def _ingest(self, paths, base="", cache_dir=None):
+        """Load audio files in parallel threads, with optional .npz cache."""
+        valid = [p for p in paths if Path(p).suffix.lower() in AUDIO_EXTS]
+        if not valid: return
+
+        results = [None] * len(valid)
+        errors  = []
+
+        def load_one(idx, path, grp):
+            # 1. try cache
+            if cache_dir:
+                try:
+                    key  = hashlib.md5(
+                        f"{path}:{os.path.getmtime(path)}:{SR}".encode()
+                    ).hexdigest()
+                    cp = Path(cache_dir) / f"{key}.npz"
+                    if cp.exists():
+                        npz = np.load(cp)
+                        return idx, npz["data"], npz["peaks"], grp, None, True
+                except Exception:
+                    pass
+            # 2. full decode
+            d, sr = Engine._read(path)
+            d = Engine._stereo(d)
+            d = Engine._resample(d, sr, SR)
+            d = np.ascontiguousarray(d, dtype=np.float32)
+            pk = _peaks(d)
+            return idx, d, pk, grp, None, False
+
+        n = len(valid)
+        workers = min(8, n)
+        done_count = [0]
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {}
+            for i, p in enumerate(valid):
                 grp = Path(p).parent.name if base else "Default"
-                self.engine.add_track(p, grp)
-            except Exception as e:
-                errors.append(f"{Path(p).name}: {e}")
+                futs[pool.submit(load_one, i, p, grp)] = p
+            for fut in as_completed(futs):
+                path = futs[fut]
+                done_count[0] += 1
+                self.root.title(f"Loading {done_count[0]}/{n}…")
+                try:
+                    idx, d, pk, grp, _, from_cache = fut.result()
+                    results[idx] = (path, d, pk, grp)
+                    # save to cache if it wasn't loaded from there
+                    if cache_dir and not from_cache:
+                        try:
+                            key = hashlib.md5(
+                                f"{path}:{os.path.getmtime(path)}:{SR}".encode()
+                            ).hexdigest()
+                            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                            np.savez_compressed(
+                                Path(cache_dir)/f"{key}.npz", data=d, peaks=pk)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    errors.append(f"{Path(path).name}: {e}")
+
+        self.root.title("MultiTrack Player")
+
+        # add tracks to engine in original order
+        for item in results:
+            if item is None: continue
+            path, d, pk, grp = item
+            if grp not in self.engine.groups:
+                self.engine.groups[grp] = Group(grp)
+            t = Track(path, d, self.engine.groups[grp], peaks=pk)
+            self.engine.tracks.append(t)
+            self.engine.total_frames = max(self.engine.total_frames, len(d))
+
         self.rebuild()
         if errors:
-            messagebox.showerror(f"Load errors ({len(errors)})",
-                                 "\n".join(errors[:15]))
+            messagebox.showerror(f"Errors ({len(errors)})", "\n".join(errors[:15]))
 
     def _clear(self):
         if messagebox.askyesno("Clear","Remove all tracks?"):
-            self.engine.pause()
-            self.engine.tracks.clear()
-            self.engine.groups.clear()
-            self.engine.total_frames = 0
-            self.engine.seek(0)
-            self.rebuild()
+            self.engine.pause(); self.engine.tracks.clear()
+            self.engine.groups.clear(); self.engine.total_frames=0
+            self.engine.seek(0); self.rebuild()
 
-    # ── drag-and-drop ────────────────────────────────────────────────────────
+    # ── drag-and-drop ─────────────────────────────────────────────────────────
     def _bind_dnd(self):
         if not _DND: return
         self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind("<<Drop>>", self._on_drop)
+        self.root.dnd_bind("<<Drop>>",self._on_drop)
 
     def _on_drop(self, event):
-        files = []; base = ""
+        files=[]; base=""
         for p in parse_dnd(event.data):
-            path = Path(p)
+            path=Path(p)
             if path.is_dir():
-                found = sorted(str(f) for f in path.rglob("*")
-                               if f.suffix.lower() in AUDIO_EXTS and f.is_file())
+                found=sorted(str(f) for f in path.rglob("*")
+                             if f.suffix.lower() in AUDIO_EXTS and f.is_file())
                 files.extend(found)
-                if found: base = str(path)
+                if found: base=str(path)
             elif path.is_file() and path.suffix.lower() in AUDIO_EXTS:
                 files.append(str(path))
-        if files: self._ingest(files, base=base)
+        if files: self._ingest(files,base=base)
 
-    # ── project ──────────────────────────────────────────────────────────────
+    # ── project ───────────────────────────────────────────────────────────────
     def _save(self):
-        p = filedialog.asksaveasfilename(
-            defaultextension=".mtproj",
+        p = filedialog.asksaveasfilename(defaultextension=".mtproj",
             filetypes=[("Project","*.mtproj"),("JSON","*.json")])
         if not p: return
-        Path(p).write_text(json.dumps({
-            "tracks": [{"path":t.path,"group":t.group.name,
-                        "muted":t.muted,"volume":t.volume}
-                       for t in self.engine.tracks],
-            "flags":  self.engine.flags,
-            "groups": {n:{"muted":g.muted} for n,g in self.engine.groups.items()},
-        }, indent=2))
-        messagebox.showinfo("Saved", p)
+        proj_path = Path(p)
+        cache_dir = proj_path.parent / f".{proj_path.stem}_cache"
+
+        data = {
+            "version":       2,
+            # playback state
+            "position":      self.engine.pos_sec,
+            "master_volume": float(self._mv.get()),
+            # UI state
+            "show_waveforms": self._show_wv,
+            "window_geometry": self.root.geometry(),
+            # tracks
+            "tracks": [
+                {"path":            t.path,
+                 "group":           t.group.name,
+                 "muted":           t.muted,
+                 "unmute_override": t.unmute_override,
+                 "volume":          t.volume}
+                for t in self.engine.tracks
+            ],
+            # groups (mute + collapse state)
+            "groups": {
+                n: {"muted": g.muted, "collapsed": g.collapsed}
+                for n, g in self.engine.groups.items()
+            },
+            # flags (9 slots, each null or seconds float)
+            "flags": [
+                (f / SR if f is not None else None)
+                for f in self.engine.flags
+            ],
+            # cache dir hint (relative)
+            "cache_dir": str(cache_dir.relative_to(proj_path.parent)),
+        }
+        proj_path.write_text(json.dumps(data, indent=2))
+
+        # write audio cache alongside the project for fast future loads
+        cache_dir.mkdir(exist_ok=True)
+        for t in self.engine.tracks:
+            try:
+                key = hashlib.md5(
+                    f"{t.path}:{os.path.getmtime(t.path)}:{SR}".encode()
+                ).hexdigest()
+                cp = cache_dir / f"{key}.npz"
+                if not cp.exists():
+                    np.savez_compressed(cp, data=t.data, peaks=t.peaks)
+            except Exception:
+                pass
+
+        messagebox.showinfo("Saved", str(proj_path))
 
     def _open_proj(self):
         p = filedialog.askopenfilename(
             filetypes=[("Project","*.mtproj"),("JSON","*.json")])
         if not p: return
-        try: data = json.loads(Path(p).read_text())
-        except Exception as e: messagebox.showerror("Error",str(e)); return
+        try:
+            raw = json.loads(Path(p).read_text())
+        except Exception as e:
+            messagebox.showerror("Error", str(e)); return
+
+        proj_path = Path(p)
+        # Resolve cache dir
+        cache_hint = raw.get("cache_dir", "")
+        cache_dir  = (proj_path.parent / cache_hint) if cache_hint else None
+        if cache_dir and not cache_dir.is_dir():
+            cache_dir = None
+
         self.engine.pause()
         self.engine.tracks.clear(); self.engine.groups.clear()
         self.engine.total_frames = 0
-        for td in data.get("tracks",[]):
-            try:
-                t = self.engine.add_track(td["path"], td.get("group","Default"))
-                t.muted = td.get("muted",False); t.volume = td.get("volume",1.0)
+
+        # Restore group metadata BEFORE loading tracks (so groups exist)
+        for n, gd in raw.get("groups", {}).items():
+            g = Group(n)
+            g.muted     = gd.get("muted",     False)
+            g.collapsed = gd.get("collapsed",  False)
+            self.engine.groups[n] = g
+
+        # Load tracks in parallel (with cache)
+        track_metas = raw.get("tracks", [])
+        paths  = [td["path"] for td in track_metas]
+        groups = [td.get("group", "Default") for td in track_metas]
+
+        results  = [None] * len(paths)
+        errors   = []
+        n_tracks = len(paths)
+
+        def load_one(idx, path, grp):
+            if cache_dir:
+                try:
+                    key = hashlib.md5(
+                        f"{path}:{os.path.getmtime(path)}:{SR}".encode()
+                    ).hexdigest()
+                    cp = cache_dir / f"{key}.npz"
+                    if cp.exists():
+                        npz = np.load(cp)
+                        return idx, npz["data"], npz["peaks"], grp, None
+                except Exception:
+                    pass
+            d, sr = Engine._read(path)
+            d = Engine._stereo(d); d = Engine._resample(d, sr, SR)
+            d = np.ascontiguousarray(d, dtype=np.float32)
+            return idx, d, _peaks(d), grp, None
+
+        done_count = [0]
+        with ThreadPoolExecutor(max_workers=min(8, max(1, n_tracks))) as pool:
+            futs = {pool.submit(load_one, i, paths[i], groups[i]): i
+                    for i in range(n_tracks)}
+            for fut in as_completed(futs):
+                done_count[0] += 1
+                self.root.title(f"Loading {done_count[0]}/{n_tracks}…")
+                try:
+                    idx, d, pk, grp, _ = fut.result()
+                    results[idx] = (paths[idx], d, pk, grp)
+                except Exception as e:
+                    errors.append(f"{Path(paths[futs[fut]]).name}: {e}")
+
+        self.root.title("MultiTrack Player")
+
+        for item, td in zip(results, track_metas):
+            if item is None: continue
+            path, d, pk, grp = item
+            if grp not in self.engine.groups:
+                self.engine.groups[grp] = Group(grp)
+            t = Track(path, d, self.engine.groups[grp], peaks=pk)
+            t.muted           = td.get("muted",           False)
+            t.unmute_override = td.get("unmute_override", False)
+            t.volume          = td.get("volume",          1.0)
+            self.engine.tracks.append(t)
+            self.engine.total_frames = max(self.engine.total_frames, len(d))
+
+        # Restore flags (stored as seconds → convert to frames)
+        raw_flags = raw.get("flags", [None]*NFLAGS)
+        self.engine.flags = [
+            int(f * SR) if f is not None else None
+            for f in (raw_flags + [None]*NFLAGS)[:NFLAGS]
+        ]
+
+        # Restore master volume
+        mv = raw.get("master_volume", 1.0)
+        self._mv.set(mv); self.engine.master_vol = mv
+
+        # Restore waveform toggle
+        show_wv = raw.get("show_waveforms", True)
+        self._show_wv = show_wv
+        self._wv_btn.configure(fg=GREEN if show_wv else FG2)
+
+        # Restore window geometry
+        geom = raw.get("window_geometry", "")
+        if geom:
+            try: self.root.geometry(geom)
             except Exception: pass
-        for n,gd in data.get("groups",{}).items():
-            if n in self.engine.groups:
-                self.engine.groups[n].muted = gd.get("muted",False)
-        fl = data.get("flags",[None]*NFLAGS)
-        self.engine.flags = (list(fl)+[None]*NFLAGS)[:NFLAGS]
-        self.engine.seek(0); self.rebuild()
 
+        self.rebuild()
+
+        # Seek to saved position (after rebuild so stream is ready)
+        pos = raw.get("position", 0.0)
+        if pos: self.engine.seek_sec(pos)
+
+        if errors:
+            messagebox.showerror(f"Errors ({len(errors)})", "\n".join(errors[:15]))
+
+    # ── flags ─────────────────────────────────────────────────────────────────
     def _set_flag(self, idx):
-        """Pin a flag at the current position and flash the Set button."""
         self.engine.set_flag(idx)
-        b = self._set_fbs[idx]
-        b.configure(bg=YELLOW, fg=BG)
-        self.root.after(300, lambda: b.configure(bg=BG4, fg=FG2))
+        b = self._set_fbs[idx]; b.configure(bg=YELLOW,fg=BG)
+        self.root.after(300, lambda: b.configure(bg=BG4,fg=FG2))
 
-    # ── keyboard ─────────────────────────────────────────────────────────────
-    # Shift+numrow produces DIFFERENT keysyms on US layout (exclam, at, …).
-    # Map them explicitly so keyboard shortcuts actually work.
-    _SHIFT_NUMS = {
-        "exclam":0, "at":1, "numbersign":2, "dollar":3, "percent":4,
-        "asciicircum":5, "ampersand":6, "asterisk":7, "parenleft":8,
-    }
+    # ── keyboard ──────────────────────────────────────────────────────────────
+    _SHIFT_NUMS = {"exclam":0,"at":1,"numbersign":2,"dollar":3,"percent":4,
+                   "asciicircum":5,"ampersand":6,"asterisk":7,"parenleft":8}
 
     def _bind_keys(self):
         self.root.bind_all("<KeyPress>", self._on_key)
 
     def _on_key(self, e):
-        if isinstance(e.widget, (tk.Entry, tk.Text)):
-            return
-
-        ctrl = bool(e.state & 0x0004)
-        shift = bool(e.state & 0x0001)
-        key  = e.keysym
-
-        if key == "space":
-            self.engine.toggle()
-        elif key == "Left":
-            self.engine.seek_rel(-60 if ctrl else -30 if shift else -5)
-        elif key == "Right":
-            self.engine.seek_rel(+60 if ctrl else +30 if shift else +5)
-        elif key == "Home":
-            self.engine.seek(0)
-        elif key == "End":
-            self.engine.seek(self.engine.total_frames)
-        elif key in "123456789":
-            # Plain number → go to flag
-            self.engine.goto_flag(int(key) - 1)
-        elif key in self._SHIFT_NUMS:
-            # Shift+number on US layout → set flag
-            self._set_flag(self._SHIFT_NUMS[key])
-        else:
-            return  # don't consume unknown keys
-
+        if isinstance(e.widget,(tk.Entry,tk.Text)): return
+        ctrl=bool(e.state&0x0004); shift=bool(e.state&0x0001); key=e.keysym
+        if   key=="space":  self.engine.toggle()
+        elif key=="Left":   self.engine.seek_rel(-60 if ctrl else -30 if shift else -5)
+        elif key=="Right":  self.engine.seek_rel(+60 if ctrl else +30 if shift else +5)
+        elif key=="Home":   self.engine.seek(0)
+        elif key=="End":    self.engine.seek(self.engine.total_frames)
+        elif key in "123456789":      self.engine.goto_flag(int(key)-1)
+        elif key in self._SHIFT_NUMS: self._set_flag(self._SHIFT_NUMS[key])
+        else: return
         return "break"
 
-    # ── poll ─────────────────────────────────────────────────────────────────
+    # ── poll ──────────────────────────────────────────────────────────────────
     def _poll(self):
         playing = self.engine.playing
         self._pb.configure(text="⏸ Pause" if playing else "▶  Play",
-                           fg=YELLOW       if playing else FG)
+                           fg=YELLOW if playing else FG)
         self._tv.set(f"{fmt(self.engine.pos_sec)} / {fmt(self.engine.dur_sec)}")
         self._mv_lbl.configure(text=f"{int(self._mv.get()*100)}%")
-        self._sb.update()
-        for i, (gb, sb) in enumerate(zip(self._fbs, self._set_fbs)):
+        self._seekbar.update()
+        frac = self.engine.frame / max(1, self.engine.total_frames)
+        for row in self._rows: row.update_pos(frac)
+        for i,(gb,sb) in enumerate(zip(self._fbs,self._set_fbs)):
             has = self.engine.flags[i] is not None
-            # Go button: bright when flag is set, dim when not
             gb.configure(bg=YELLOW if has else BG3, fg=BG if has else FG2)
-            # Set button: show time label when flag is set
             if has:
-                t = fmt(self.engine.flags[i] / SR)
-                sb.configure(text=f"{i+1}\n{t}", font=("monospace",7))
+                sb.configure(text=f"{i+1}\n{fmt(self.engine.flags[i]/SR)}",font=("monospace",7))
             else:
-                sb.configure(text=str(i+1), font=("monospace",9))
+                sb.configure(text=str(i+1),font=("monospace",9))
         self.root.after(POLL_MS, self._poll)
 
     def _on_close(self):
@@ -765,6 +965,5 @@ class App:
         self.rebuild(); self.root.mainloop()
 
 
-# ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     App().run()
