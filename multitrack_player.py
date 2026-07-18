@@ -123,6 +123,9 @@ class Engine:
         self._frame = 0; self._playing = False; self._seek = None
         self.flags = [None]*NFLAGS; self._stream = None
         self._buf = np.zeros((BLOCKSIZE+256, NCH), dtype=np.float32)
+        self.loop_enabled = True
+        self.loop_start   = 0            # frame
+        self.loop_end     = None         # frame, None = end of longest track
 
     @property
     def frame(self):    return self._frame
@@ -132,6 +135,14 @@ class Engine:
     def pos_sec(self):  return self._frame / SR
     @property
     def dur_sec(self):  return self.total_frames / SR
+
+    @property
+    def loop_a(self):
+        return max(0, min(int(self.loop_start), self.total_frames))
+    @property
+    def loop_b(self):
+        e = self.total_frames if self.loop_end is None else int(self.loop_end)
+        return max(0, min(e, self.total_frames))
 
     @staticmethod
     def _read(path):
@@ -177,17 +188,29 @@ class Engine:
         if frames > self._buf.shape[0]: self._buf = np.zeros((frames+64,NCH), dtype=np.float32)
         s = self._seek
         if s is not None: self._seek = None; self._frame = s
-        pos = self._frame
-        if not self._playing or pos >= self.total_frames: outdata.fill(0.0); return
+        if not self._playing or self._frame >= self.total_frames: outdata.fill(0.0); return
+
         buf = self._buf[:frames]; buf.fill(0.0); mv = self.master_vol
-        for t in self.tracks[:]:
-            if t.effective_mute: continue
-            end = min(pos+frames, len(t.data)); n = end-pos
-            if n <= 0: continue
-            buf[:n] += t.data[pos:end] * (t.volume * mv)
+        looping = self.loop_enabled and (self.loop_b - self.loop_a) > 0
+        seg_end = self.loop_b if looping else self.total_frames
+        frame, written = self._frame, 0
+
+        while written < frames:
+            if looping and frame >= seg_end: frame = self.loop_a
+            if frame >= seg_end: break
+            n = min(frames - written, seg_end - frame)
+            if n <= 0: break
+            for t in self.tracks[:]:
+                if t.effective_mute: continue
+                m = min(frame+n, len(t.data)) - frame
+                if m <= 0: continue
+                buf[written:written+m] += t.data[frame:frame+m] * (t.volume * mv)
+            written += n; frame += n
+
         np.clip(buf, -1.0, 1.0, out=buf); outdata[:] = buf
-        self._frame += frames
-        if self._frame >= self.total_frames: self._playing = False; self._frame = self.total_frames
+        self._frame = frame
+        if not looping and self._frame >= self.total_frames:
+            self._playing = False; self._frame = self.total_frames
 
     def _open(self):
         if self._stream and self._stream.active: return
@@ -205,6 +228,20 @@ class Engine:
     def set_flag(self, i):  self.flags[i] = self._frame
     def goto_flag(self, i):
         if self.flags[i] is not None: self.seek(self.flags[i])
+
+    MIN_LOOP_SEC = 0.25
+    def set_loop_start(self, f):
+        f = max(0, min(int(f), self.total_frames))
+        min_gap = int(self.MIN_LOOP_SEC * SR)
+        self.loop_start = min(f, self.loop_b - min_gap) if self.loop_b else f
+        self.loop_start = max(0, self.loop_start)
+    def set_loop_end(self, f):
+        f = max(0, min(int(f), self.total_frames))
+        min_gap = int(self.MIN_LOOP_SEC * SR)
+        f = max(f, self.loop_a + min_gap)
+        self.loop_end = min(f, self.total_frames)
+    def reset_loop(self):    self.loop_start = 0; self.loop_end = None
+    def toggle_loop(self):   self.loop_enabled = not self.loop_enabled
     def close(self):
         self._playing = False
         if self._stream: self._stream.stop(); self._stream.close(); self._stream = None
@@ -215,26 +252,31 @@ class Engine:
 class WaveformCanvas(tk.Canvas):
     """
     Performance-optimised waveform display.
-    - Waveform lines drawn ONCE after layout (never redrawn unless mute state changes).
+    - Waveform envelope is a SINGLE polygon item (not one line per pixel column),
+      redrawn only on resize (debounced) or mute-colour change.
     - Playhead & overlay are pre-created items moved with coords() — zero alloc per frame.
     """
+    RESIZE_DEBOUNCE_MS = 60
+
     def __init__(self, parent, track, **kw):
         super().__init__(parent, bg=BG3, height=WV_H, highlightthickness=0, **kw)
         self._track_peaks = track.peaks
         self._muted       = False
         self._last_frac   = 0.0
+        self._resize_job  = None
+        # Single polygon item holds the whole waveform envelope
+        self._wv = self.create_polygon(0, 0, 0, 0, fill=ACCENT, outline="", tags="wv")
         # Pre-create overlay + playhead so update_pos never allocates
         self._ov = self.create_rectangle(0, 0, 0, WV_H, fill=BG5,
                                          stipple="gray25", outline="", state="hidden")
         self._ph = self.create_line(0, 0, 0, WV_H, fill=PURPLE, width=1)
-        # Draw waveform once the widget has a real width
-        self.after_idle(self._initial_draw)
+        self.bind("<Configure>", self._on_configure)
 
-    def _initial_draw(self):
-        if self.winfo_width() > 1:
-            self._draw_wv()
-        else:
-            self.after(50, self._initial_draw)   # retry until layout is done
+    def _on_configure(self, _e=None):
+        """Debounce resize — rebuild the polygon once resizing settles."""
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(self.RESIZE_DEBOUNCE_MS, self._draw_wv)
 
     def _resample_peaks(self, width):
         src = self._track_peaks
@@ -244,14 +286,20 @@ class WaveformCanvas(tk.Canvas):
                          np.linspace(0, 1, len(src)), src).astype(np.float32)
 
     def _draw_wv(self):
-        """Draw static waveform lines. Called once (or when mute colour changes)."""
-        self.delete("wv")
-        w   = max(1, self.winfo_width())
+        """Rebuild the waveform polygon. Called on resize settle / mute change."""
+        self._resize_job = None
+        w = max(1, self.winfo_width())
+        if w <= 1:
+            return
         mid = WV_H // 2
         col = FG2 if self._muted else ACCENT
-        for x, p in enumerate(self._resample_peaks(w)):
-            amp = max(1, int(p * (mid - 2) * 0.95))
-            self.create_line(x, mid - amp, x, mid + amp, fill=col, tags="wv")
+        amps = np.maximum(1, (self._resample_peaks(w) * (mid - 2) * 0.95)).astype(np.int32)
+        xs  = np.arange(w, dtype=np.int32)
+        top = np.column_stack((xs, mid - amps))
+        bot = np.column_stack((xs[::-1], (mid + amps)[::-1]))
+        pts = np.concatenate((top, bot)).ravel().tolist()
+        self.coords(self._wv, *pts)
+        self.itemconfig(self._wv, fill=col)
         # Keep overlay + playhead on top
         self.tag_raise(self._ov)
         self.tag_raise(self._ph)
@@ -277,14 +325,17 @@ class WaveformCanvas(tk.Canvas):
 # ── seek bar ──────────────────────────────────────────────────────────────────
 
 class SeekBar(tk.Canvas):
-    PAD = 28
+    PAD        = 28
+    HANDLE_HIT = 8      # px hit-test radius for loop A/B handles
+
     def __init__(self, parent, engine, **kw):
-        super().__init__(parent, bg=BG, height=58, highlightthickness=0, cursor="hand2", **kw)
-        self.engine = engine; self._drag = False
+        super().__init__(parent, bg=BG, height=64, highlightthickness=0, cursor="hand2", **kw)
+        self.engine = engine; self._drag = False; self._loop_drag = None
+        self._ax = self._bx = 0
         self.bind("<Configure>", self._draw)
         self.bind("<ButtonPress-1>",   self._press)
         self.bind("<B1-Motion>",       self._motion)
-        self.bind("<ButtonRelease-1>", lambda _: setattr(self,"_drag",False))
+        self.bind("<ButtonRelease-1>", self._release)
 
     def _frac(self, x):
         w = self.winfo_width()
@@ -292,26 +343,59 @@ class SeekBar(tk.Canvas):
     def _tx(self, frame):
         w = self.winfo_width()
         return self.PAD + (frame/max(1,self.engine.total_frames))*(w-2*self.PAD)
+
     def _press(self, e):
-        self._drag = True; self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
+        if abs(e.x - self._ax) <= self.HANDLE_HIT:
+            self._loop_drag = "a"
+        elif abs(e.x - self._bx) <= self.HANDLE_HIT:
+            self._loop_drag = "b"
+        else:
+            self._drag = True
+            self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
+
     def _motion(self, e):
-        if self._drag: self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
+        if self._loop_drag == "a":
+            self.engine.set_loop_start(self._frac(e.x)*self.engine.total_frames); self._draw()
+        elif self._loop_drag == "b":
+            self.engine.set_loop_end(self._frac(e.x)*self.engine.total_frames); self._draw()
+        elif self._drag:
+            self.engine.seek(int(self._frac(e.x)*self.engine.total_frames))
+
+    def _release(self, _e):
+        self._drag = False; self._loop_drag = None
+
     def update(self): self._draw()
+
     def _draw(self, *_):
         self.delete("all"); w = self.winfo_width()
         if w < 30: return
         MID, BH = 36, 6
         self.create_rectangle(self.PAD, MID-BH, w-self.PAD, MID+BH, fill=BG4, outline="")
+
+        # loop region band
+        self._ax = self._tx(self.engine.loop_a); self._bx = self._tx(self.engine.loop_b)
+        band_col = GREEN if self.engine.loop_enabled else FG2
+        self.create_rectangle(self._ax, MID-BH, self._bx, MID+BH,
+                              fill=band_col, stipple="gray25", outline="")
+
         px = self._tx(self.engine.frame)
         if px > self.PAD:
             self.create_rectangle(self.PAD, MID-BH, px, MID+BH, fill=ACCENT, outline="")
         self.create_line(px, MID-16, px, MID+16, fill=PURPLE, width=2)
         self.create_oval(px-5, MID-5, px+5, MID+5, fill=PURPLE, outline=BG2, width=1)
+
         for i, f in enumerate(self.engine.flags):
             if f is None: continue
             fx = self._tx(f)
             self.create_polygon(fx-5,MID-BH-3, fx+5,MID-BH-3, fx,MID-BH+4, fill=YELLOW, outline="")
             self.create_text(fx, MID-BH-12, text=str(i+1), fill=YELLOW, font=("monospace",7,"bold"))
+
+        # loop A/B handles — drawn below the bar so they don't collide with flags above it
+        hy = MID+BH+4
+        self.create_polygon(self._ax-6,hy, self._ax+6,hy, self._ax,hy+6, fill=band_col, outline="")
+        self.create_text(self._ax, hy+13, text="A", fill=band_col, font=("monospace",8,"bold"))
+        self.create_polygon(self._bx-6,hy, self._bx+6,hy, self._bx,hy+6, fill=band_col, outline="")
+        self.create_text(self._bx, hy+13, text="B", fill=band_col, font=("monospace",8,"bold"))
 
 
 # ── group header ──────────────────────────────────────────────────────────────
@@ -379,13 +463,14 @@ class TrackRow(tk.Frame):
                           M (orange) → click → GRN ↑  (override: track plays)
       Overriding group:   ↑ (green)  → click → orange M (back to group mute)
     """
-    def __init__(self, parent, track, engine, on_rebuild, on_refresh, **kw):
+    def __init__(self, parent, track, engine, on_rebuild, on_refresh, show_wv=True, **kw):
         super().__init__(parent, bg=BG2, **kw)
         self.track = track; self.engine = engine
         self._rebuild = on_rebuild; self._refresh = on_refresh
-        self._build()
+        self._wv = None
+        self._build(show_wv)
 
-    def _build(self):
+    def _build(self, show_wv):
         # ── left-anchored fixed items ──
         self._mb = mk_btn(self, "M", self._toggle_mute, width=2, padx=4, pady=3)
         self._mb.pack(side="left", padx=(6,3), pady=3)
@@ -409,10 +494,16 @@ class TrackRow(tk.Frame):
                   ).pack(side="right", padx=4)
 
         # ── waveform: last — fills ALL remaining horizontal space ──
-        self._wv = WaveformCanvas(self, self.track)
-        self._wv.pack(side="left", fill="x", expand=True, padx=4, pady=2)
+        # Created lazily (only when waveforms are toggled on) since it's the laggy part.
+        if show_wv:
+            self._create_wv()
 
         self._sync()
+
+    def _create_wv(self):
+        if self._wv is None:
+            self._wv = WaveformCanvas(self, self.track)
+        self._wv.pack(side="left", fill="x", expand=True, padx=4, pady=2)
 
     def _toggle_mute(self):
         t = self.track
@@ -433,13 +524,14 @@ class TrackRow(tk.Frame):
     def _sync(self):
         t = self.track
         if t.muted:
-            self._mb.configure(bg=RED,    fg=BG,  text="M"); self._wv.set_muted(True)
+            self._mb.configure(bg=RED,    fg=BG,  text="M"); wv_muted = True
         elif t.unmute_override:
-            self._mb.configure(bg=GREEN,  fg=BG,  text="↑"); self._wv.set_muted(False)
+            self._mb.configure(bg=GREEN,  fg=BG,  text="↑"); wv_muted = False
         elif t.group.muted:
-            self._mb.configure(bg=ORANGE, fg=BG,  text="M"); self._wv.set_muted(True)
+            self._mb.configure(bg=ORANGE, fg=BG,  text="M"); wv_muted = True
         else:
-            self._mb.configure(bg=BG4,   fg=FG2, text="M"); self._wv.set_muted(False)
+            self._mb.configure(bg=BG4,   fg=FG2, text="M"); wv_muted = False
+        if self._wv is not None: self._wv.set_muted(wv_muted)
 
     def _on_vol(self, v):
         v = float(v); self.track.volume = v; self._vl.configure(text=f"{int(v*100)}%")
@@ -460,14 +552,16 @@ class TrackRow(tk.Frame):
         self.winfo_toplevel().after(1, self._rebuild)
 
     def refresh(self):   self._sync()
-    def update_pos(self, frac): self._wv.update_pos(frac)
+    def update_pos(self, frac):
+        if self._wv is not None: self._wv.update_pos(frac)
 
     def set_waveform_visible(self, visible: bool):
         if visible:
-            # Re-pack after the right-side items so it still expands correctly
-            self._wv.pack(side="left", fill="x", expand=True, padx=4, pady=2)
+            # Created on first use (lazy) — re-packed after the right-side items
+            # so it still expands correctly.
+            self._create_wv()
             self._wv.after_idle(self._wv._draw_wv)   # redraw at current width
-        else:
+        elif self._wv is not None:
             self._wv.pack_forget()
 
 
@@ -503,9 +597,11 @@ class App:
         mk_btn(tb,"Mute All",   self._mute_all,   fg=RED   ).pack(side="left",padx=2)
         mk_btn(tb,"Unmute All", self._unmute_all, fg=GREEN ).pack(side="left",padx=2)
         tk.Frame(tb,bg=BG5,width=1).pack(side="left",fill="y",padx=8,pady=3)
-        self._show_wv = True
-        self._wv_btn = mk_btn(tb, "📊 Waves", self._toggle_waveforms, fg=GREEN)
+        self._show_wv = False   # off by default — waveform rendering is the laggy part
+        self._wv_btn = mk_btn(tb, "📊 Waves", self._toggle_waveforms, fg=FG2)
         self._wv_btn.pack(side="left", padx=2)
+        self._loop_btn = mk_btn(tb, "🔁 Loop", self._toggle_loop, fg=GREEN)
+        self._loop_btn.pack(side="left", padx=2)
         tk.Frame(tb,bg=BG5,width=1).pack(side="left",fill="y",padx=8,pady=3)
         mk_btn(tb,"Clear All",  self._clear,      fg=FG2   ).pack(side="left",padx=2)
         hint = "Space  ←/→±5s  Shift±30s  1-9 flag  Shift+1-9 set"
@@ -583,6 +679,18 @@ class App:
         tk.Label(gr_,text="  jump  (dims when unset)",
                  bg=BG,fg=BG5,font=("monospace",8)).pack(side="left",padx=4)
 
+        lp_ = tk.Frame(ff,bg=BG); lp_.pack(fill="x",pady=(2,0))
+        tk.Label(lp_,text="Loop:",bg=BG,fg=FG2,font=("monospace",8),
+                 width=8,anchor="e").pack(side="left",padx=(0,4))
+        mk_btn(lp_,"Set Loop A",self._set_loop_a,fg=GREEN,font=("monospace",8),
+               padx=6,pady=2).pack(side="left",padx=2)
+        mk_btn(lp_,"Set Loop B",self._set_loop_b,fg=GREEN,font=("monospace",8),
+               padx=6,pady=2).pack(side="left",padx=2)
+        mk_btn(lp_,"Reset 0–100%",self._reset_loop,fg=FG2,font=("monospace",8),
+               padx=6,pady=2).pack(side="left",padx=2)
+        tk.Label(lp_,text="  pin current position as loop start/end",
+                 bg=BG,fg=BG5,font=("monospace",8)).pack(side="left",padx=4)
+
     # ── track list ────────────────────────────────────────────────────────────
     def rebuild(self):
         for w in self._inner.winfo_children(): w.destroy()
@@ -602,10 +710,9 @@ class App:
             trows = []
             for t in tracks:
                 row = TrackRow(self._inner,t,self.engine,
-                               on_rebuild=self.rebuild,on_refresh=self._refresh_rows)
+                               on_rebuild=self.rebuild,on_refresh=self._refresh_rows,
+                               show_wv=self._show_wv)
                 row.pack(fill="x",padx=(24,4),pady=1)
-                if not self._show_wv:
-                    row._wv.pack_forget()
                 self._rows.append(row); trows.append(row)
             hdr.set_rows(trows)
         tk.Frame(self._inner,bg=BG,height=12).pack()
@@ -630,6 +737,21 @@ class App:
         self._wv_btn.configure(fg=GREEN if self._show_wv else FG2)
         for row in self._rows:
             row.set_waveform_visible(self._show_wv)
+
+    # ── loop ──────────────────────────────────────────────────────────────────
+    def _toggle_loop(self):
+        self.engine.toggle_loop()
+        self._loop_btn.configure(fg=GREEN if self.engine.loop_enabled else FG2)
+        self._seekbar.update()
+
+    def _set_loop_a(self):
+        self.engine.set_loop_start(self.engine.frame); self._seekbar.update()
+
+    def _set_loop_b(self):
+        self.engine.set_loop_end(self.engine.frame); self._seekbar.update()
+
+    def _reset_loop(self):
+        self.engine.reset_loop(); self._seekbar.update()
 
     # ── file loading ──────────────────────────────────────────────────────────
     def _add_files(self):
@@ -756,10 +878,14 @@ class App:
         cache_dir = proj_path.parent / f".{proj_path.stem}_cache"
 
         data = {
-            "version":       2,
+            "version":       3,
             # playback state
             "position":      self.engine.pos_sec,
             "master_volume": float(self._mv.get()),
+            # loop state
+            "loop_enabled": self.engine.loop_enabled,
+            "loop_start":   self.engine.loop_a / SR,
+            "loop_end":     (self.engine.loop_end / SR) if self.engine.loop_end is not None else None,
             # UI state
             "show_waveforms": self._show_wv,
             "window_geometry": self.root.geometry(),
@@ -893,8 +1019,15 @@ class App:
         mv = raw.get("master_volume", 1.0)
         self._mv.set(mv); self.engine.master_vol = mv
 
+        # Restore loop state
+        self.engine.loop_enabled = raw.get("loop_enabled", True)
+        self.engine.loop_start   = int(raw.get("loop_start", 0.0) * SR)
+        loop_end_sec = raw.get("loop_end", None)
+        self.engine.loop_end = int(loop_end_sec * SR) if loop_end_sec is not None else None
+        self._loop_btn.configure(fg=GREEN if self.engine.loop_enabled else FG2)
+
         # Restore waveform toggle
-        show_wv = raw.get("show_waveforms", True)
+        show_wv = raw.get("show_waveforms", False)
         self._show_wv = show_wv
         self._wv_btn.configure(fg=GREEN if show_wv else FG2)
 
@@ -905,6 +1038,7 @@ class App:
             except Exception: pass
 
         self.rebuild()
+        self._seekbar.update()
 
         # Seek to saved position (after rebuild so stream is ready)
         pos = raw.get("position", 0.0)
